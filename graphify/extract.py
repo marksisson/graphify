@@ -4406,6 +4406,227 @@ def extract_elixir(path: Path) -> dict:
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls, "input_tokens": 0, "output_tokens": 0}
 
 
+def extract_nix(path: Path) -> dict:
+    """Extract let bindings, attribute sets, function definitions, and calls from .nix files.
+
+    Structural walk (first pass):
+      - file → binding/attrset hierarchy with defines/contains edges
+      - function_expression values are named by their binding attrpath, not their
+        formal parameters (Nix lambdas are anonymous; names come from bindings)
+
+    Call-graph second pass:
+      - apply_expression nodes → INFERRED calls edges within / across functions
+    """
+    try:
+        import tree_sitter_nix as tsnix
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree_sitter_nix not installed"}
+
+    try:
+        language = Language(tsnix.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    # (owner_nid, body_node) pairs deferred to the call-graph second pass
+    function_bodies: list[tuple[str, Any]] = []
+    raw_calls: list[dict] = []
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}"})
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    def _attr_path_text(node) -> str | None:
+        """Build a dotted attribute path from an attrpath node."""
+        parts: list[str] = []
+        for child in node.children:
+            if child.type == "identifier":
+                parts.append(_read_text(child, source))
+        return ".".join(parts) if parts else None
+
+    def _callee_name(node) -> str | None:
+        """Best-effort callee name from the function side of an apply_expression."""
+        if node.type == "variable_expression":
+            for child in node.children:
+                if child.type == "identifier":
+                    return _read_text(child, source)
+        if node.type == "select_expression":
+            # e.g. pkgs.stdenv.mkDerivation → last segment "mkDerivation"
+            attr = node.child_by_field_name("attrpath")
+            if attr:
+                return _attr_path_text(attr)
+        return None
+
+    def _process_binding(binding, scope_nid: str) -> None:
+        """Create a node + edge for one binding under scope_nid.
+
+        When the binding value is a function_expression the binding attrpath
+        IS the function name (Nix lambdas are anonymous — names come from
+        their binding, not from formal parameters).
+        """
+        attrpath = binding.child_by_field_name("attrpath")
+        if not attrpath:
+            return
+        name = _attr_path_text(attrpath)
+        if not name:
+            return
+        line = binding.start_point[0] + 1
+        value = binding.child_by_field_name("expression")
+
+        is_func = value is not None and value.type == "function_expression"
+        label = f"{name}()" if is_func else name
+
+        # Unique ID: stem-qualified for top-level, scope-qualified for nested
+        bind_nid = _make_id(stem, name) if scope_nid == file_nid else _make_id(scope_nid, name)
+        add_node(bind_nid, label, line)
+        relation = "defines" if scope_nid == file_nid else "contains"
+        add_edge(scope_nid, bind_nid, relation, line)
+
+        if value:
+            if is_func:
+                # Defer body to the call-graph second pass; do NOT recurse
+                # into the function body here to avoid structural double-walk.
+                body = value.child_by_field_name("body")
+                if body:
+                    function_bodies.append((bind_nid, body))
+            else:
+                # Recurse into non-function values (nested attrsets, let, …)
+                walk(value, bind_nid)
+
+    def walk(node, scope_nid: str | None = None) -> None:
+        """Structural first pass: collect bindings and attrset hierarchies."""
+        parent = scope_nid if scope_nid is not None else file_nid
+        t = node.type
+
+        # let ... in ...
+        if t == "let_expression":
+            for child in node.children:
+                if child.type == "binding_set":
+                    for binding in child.children:
+                        if binding.type == "binding":
+                            _process_binding(binding, parent)
+            body = node.child_by_field_name("body")
+            if body:
+                walk(body, parent)
+            return
+
+        # { ... } / rec { ... }
+        if t in ("attrset_expression", "rec_attrset_expression"):
+            for child in node.children:
+                if child.type == "binding_set":
+                    for binding in child.children:
+                        if binding.type == "binding":
+                            _process_binding(binding, parent)
+            return
+
+        # binding_set at root level (some grammar versions expose it directly)
+        if t == "binding_set":
+            for binding in node.children:
+                if binding.type == "binding":
+                    _process_binding(binding, parent)
+            return
+
+        # Top-level function_expression: whole file is `{ pkgs }: { ... }`
+        # Name it after the file stem so it has a meaningful label.
+        if t == "function_expression":
+            line = node.start_point[0] + 1
+            func_nid = _make_id(stem, "toplevel")
+            add_node(func_nid, f"{stem}()", line)
+            add_edge(file_nid, func_nid, "contains", line)
+            body = node.child_by_field_name("body")
+            if body:
+                function_bodies.append((func_nid, body))
+                walk(body, func_nid)
+            return
+
+        # Default: recurse
+        for child in node.children:
+            walk(child, scope_nid)
+
+    walk(root)
+
+    # Build a name→nid lookup for INFERRED call resolution (used by walk_calls).
+    # Strip trailing "()" so callee name "helperFn" matches node label "helperFn()".
+    _name_to_nid: dict[str, str] = {}
+    for _n in nodes:
+        _short = _n["label"].rstrip("()").lower()
+        if _short:
+            _name_to_nid[_short] = _n["id"]
+
+    def walk_calls(node, caller_nid: str) -> None:
+        """Call-graph second pass: emit INFERRED calls edges from apply_expression."""
+        t = node.type
+        # Stop at nested function boundaries — their bodies are in function_bodies
+        # and will be walked separately with their own caller_nid.
+        if t == "function_expression":
+            return
+        if t == "apply_expression":
+            # apply_expression has two unnamed children: (function, argument).
+            # Use named_children to skip punctuation tokens.
+            named = [c for c in node.children if c.is_named]
+            fn_node = named[0] if named else None
+            if fn_node is not None:
+                callee = _callee_name(fn_node)
+                _BUILTIN_SKIP = frozenset({"import", "builtins", "throw", "abort", "assert",
+                                           "true", "false", "null"})
+                if callee and callee not in _BUILTIN_SKIP:
+                    line = node.start_point[0] + 1
+                    # Resolve callee via the name→nid map built from the first pass.
+                    # This handles scope-qualified IDs (e.g. helperFn defined inside
+                    # a top-level lambda) that stem-only _make_id lookups would miss.
+                    callee_nid = _name_to_nid.get(callee.lower())
+                    if callee_nid is None:
+                        # Fallback: try stem-qualified or bare _make_id
+                        callee_nid = _make_id(stem, callee)
+                        if callee_nid not in seen_ids:
+                            callee_nid = _make_id(callee)
+                    if callee_nid in seen_ids and callee_nid != caller_nid:
+                        add_edge(caller_nid, callee_nid, "calls", line,
+                                 confidence="INFERRED", weight=0.5)
+                    else:
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": callee,
+                            "source_file": str_path,
+                            "source_location": f"L{line}",
+                        })
+        for child in node.children:
+            walk_calls(child, caller_nid)
+
+    # Call-graph second pass: walk deferred function bodies for INFERRED calls
+    for caller_nid, body in function_bodies:
+        walk_calls(body, caller_nid)
+
+    clean_edges = [e for e in edges if e["source"] in seen_ids and
+                   (e["target"] in seen_ids or e["relation"] == "imports")]
+    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls,
+            "input_tokens": 0, "output_tokens": 0}
+
+
 def extract_markdown(path: Path) -> dict:
     """Extract structural nodes and edges from a Markdown file.
 
@@ -4588,6 +4809,7 @@ _DISPATCH: dict[str, Any] = {
     ".v": extract_verilog,
     ".sv": extract_verilog,
     ".sql": extract_sql,
+    ".nix": extract_nix,
     ".md": extract_markdown,
     ".mdx": extract_markdown,
     ".qmd": extract_markdown,

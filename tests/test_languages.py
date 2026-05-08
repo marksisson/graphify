@@ -6,7 +6,7 @@ from graphify.extract import (
     extract_java, extract_c, extract_cpp, extract_ruby,
     extract_csharp, extract_kotlin, extract_scala, extract_php,
     extract_swift, extract_go, extract_julia, extract_js, extract_fortran,
-    extract_groovy,
+    extract_groovy, extract_nix,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -964,3 +964,69 @@ def test_groovy_spock_no_dangling_edges():
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids
+
+
+# ── Nix extractor tests ───────────────────────────────────────────────────────
+
+def test_nix_no_error():
+    r = extract_nix(FIXTURES / "sample.nix")
+    assert "error" not in r
+
+
+def test_nix_finds_file_node():
+    r = extract_nix(FIXTURES / "sample.nix")
+    assert any("sample.nix" in n["label"] for n in r["nodes"])
+
+
+def test_nix_finds_let_bindings():
+    r = extract_nix(FIXTURES / "sample.nix")
+    labels = _labels(r)
+    assert any("version" in l for l in labels)
+    assert any("pname" in l for l in labels)
+
+
+def test_nix_names_function_by_binding_not_param():
+    # helperFn = x: ... should produce label "helperFn()", NOT "x()"
+    r = extract_nix(FIXTURES / "sample.nix")
+    labels = _labels(r)
+    assert any("helperFn" in l for l in labels)
+    assert not any(l == "x()" for l in labels)
+
+
+def test_nix_finds_top_level_attrset_bindings():
+    r = extract_nix(FIXTURES / "sample.nix")
+    labels = _labels(r)
+    assert any("myPackage" in l for l in labels)
+    assert any("devShell" in l for l in labels)
+    assert any("utils" in l for l in labels)
+
+
+def test_nix_has_defines_or_contains_edges():
+    r = extract_nix(FIXTURES / "sample.nix")
+    relations = _relations(r)
+    assert "defines" in relations or "contains" in relations
+
+
+def test_nix_has_inferred_calls_edges():
+    r = extract_nix(FIXTURES / "sample.nix")
+    # utils.double calls helperFn — should appear as INFERRED calls
+    inferred = [e for e in r["edges"] if e.get("confidence") == "INFERRED"]
+    assert inferred, "expected at least one INFERRED edge from call-graph pass"
+
+
+def test_nix_raw_calls_is_list():
+    r = extract_nix(FIXTURES / "sample.nix")
+    assert isinstance(r.get("raw_calls"), list)
+
+
+def test_nix_no_dangling_edges():
+    r = extract_nix(FIXTURES / "sample.nix")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"dangling source: {e['source']}"
+
+
+def test_nix_function_labels_have_parens():
+    r = extract_nix(FIXTURES / "sample.nix")
+    func_labels = [n["label"] for n in r["nodes"] if n["label"].endswith("()")]
+    assert func_labels, "expected at least one function node with '()' label"
